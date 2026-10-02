@@ -1,4 +1,5 @@
 import os
+import hashlib
 import eventlet
 eventlet.monkey_patch()
 
@@ -7,6 +8,7 @@ from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-change-me')
+app.config['JSON_AS_ASCII'] = False
 
 socketio = SocketIO(
     app,
@@ -16,83 +18,141 @@ socketio = SocketIO(
     engineio_logger=False,
 )
 
-# sid -> username
-clients = {}
+# ============ ХРАНИЛИЩЕ В ПАМЯТИ ============
+# users: {username: password_hash}
+users = {}
+# sessions: {sid: username}
+sessions = {}
+# dm_history: {(user_a, user_b): [{"from": ..., "text": ..., "ts": ...}, ...]}
+dm_history = {}
+# ============================================
 
 
-def broadcast_users():
-    """Рассылает всем актуальный список онлайн-пользователей."""
-    emit('users', list(clients.values()), broadcast=True)
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
 
+def dm_key(a: str, b: str) -> tuple:
+    return tuple(sorted([a, b]))
+
+
+def online_users() -> list:
+    return sorted(set(sessions.values()))
+
+
+def broadcast_user_list():
+    """Рассылает всем список зарегистрированных + флаг онлайн."""
+    payload = [
+        {"username": u, "online": u in sessions.values()}
+        for u in sorted(users.keys())
+    ]
+    emit('user_list', payload, broadcast=True)
+
+
+# ==================== HTTP ====================
+@app.route('/')
+def health():
+    return {
+        'status': 'ok',
+        'registered': len(users),
+        'online': len(sessions),
+        'users': online_users(),
+    }
+
+
+# ==================== SOCKETIO ====================
 @socketio.on('connect')
 def on_connect():
-    print(f'[+] Подключение: {request.sid}')
+    print(f'[+] Socket: {request.sid}')
 
 
-@socketio.on('join')
-def on_join(username):
-    username = (username or '').strip()[:32]
-    if not username:
-        emit('error_msg', 'Ник не может быть пустым')
+@socketio.on('register')
+def on_register(data):
+    """Регистрация или вход. data = {username, password}"""
+    username = (data.get('username') or '').strip()
+    password = data.get('password') or ''
+
+    if not username or len(username) < 2:
+        emit('auth_error', 'Ник должен быть минимум 2 символа')
         return
-    # проверка на дубликат
-    if username in clients.values():
-        emit('error_msg', 'Такой ник уже занят')
+    if len(username) > 32:
+        emit('auth_error', 'Ник слишком длинный (макс 32)')
         return
-
-    clients[request.sid] = username
-    print(f'[JOIN] {username} ({request.sid})')
-
-    emit('message',
-         {'user': 'СИСТЕМА', 'text': f'{username} присоединился к чату'},
-         broadcast=True)
-    broadcast_users()
-
-
-@socketio.on('message')
-def on_message(data):
-    user = clients.get(request.sid)
-    if not user:
-        emit('error_msg', 'Сначала войдите в чат')
+    if len(password) < 3:
+        emit('auth_error', 'Пароль минимум 3 символа')
         return
 
-    text = (data or '').strip()
+    pwd_hash = hash_password(password)
+
+    if username in users:
+        # вход существующего
+        if users[username] != pwd_hash:
+            emit('auth_error', 'Неверный пароль')
+            return
+        if username in sessions.values():
+            emit('auth_error', 'Этот ник уже в сети')
+            return
+    else:
+        # регистрация нового
+        users[username] = pwd_hash
+
+    sessions[request.sid] = username
+    print(f'[AUTH] {username}')
+
+    emit('auth_ok', {'username': username})
+    broadcast_user_list()
+
+
+@socketio.on('disconnect')
+def on_disconnect():
+    username = sessions.pop(request.sid, None)
+    if username:
+        print(f'[-] {username} отключился')
+        broadcast_user_list()
+
+
+@socketio.on('get_history')
+def on_get_history(data):
+    """data = {with_user} — вернуть историю ЛС с этим юзером."""
+    me = sessions.get(request.sid)
+    other = data.get('with_user')
+    if not me or not other:
+        return
+    history = dm_history.get(dm_key(me, other), [])
+    emit('dm_history', {'with_user': other, 'messages': history})
+
+
+@socketio.on('dm')
+def on_dm(data):
+    """Личное сообщение. data = {to, text}"""
+    me = sessions.get(request.sid)
+    if not me:
+        emit('auth_error', 'Сессия истекла, войдите заново')
+        return
+
+    to_user = (data.get('to') or '').strip()
+    text = (data.get('text') or '').strip()
+
+    if not to_user or to_user not in users:
+        emit('dm_error', 'Получатель не найден')
+        return
     if not text:
         return
     if len(text) > 2000:
         text = text[:2000]
 
-    print(f'[MSG] {user}: {text}')
-    emit('message', {'user': user, 'text': text}, broadcast=True)
+    msg = {'from': me, 'to': to_user, 'text': text}
 
+    # сохраняем в историю
+    key = dm_key(me, to_user)
+    dm_history.setdefault(key, []).append(msg)
 
-@socketio.on('typing')
-def on_typing():
-    user = clients.get(request.sid)
-    if user:
-        emit('typing', {'user': user}, broadcast=True, include_self=False)
-
-
-@socketio.on('disconnect')
-def on_disconnect():
-    user = clients.pop(request.sid, None)
-    if user:
-        print(f'[-] {user} отключился')
-        emit('message',
-             {'user': 'СИСТЕМА', 'text': f'{user} покинул чат'},
-             broadcast=True)
-        broadcast_users()
-
-
-@app.route('/')
-def health():
-    """Эндпоинт для пинга (UptimeRobot)."""
-    return {
-        'status': 'ok',
-        'online': len(clients),
-        'users': list(clients.values()),
-    }
+    # отправляем получателю, если онлайн
+    for sid, name in list(sessions.items()):
+        if name == to_user:
+            emit('dm', msg, to=sid)
+    # отправителю — эхо, чтобы показал у себя
+    emit('dm', msg, to=request.sid)
 
 
 if __name__ == '__main__':
