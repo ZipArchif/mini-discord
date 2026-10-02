@@ -2,6 +2,7 @@ import os
 import hashlib
 import eventlet
 eventlet.monkey_patch()
+from livekit import api as lk_api
 
 from flask import Flask, request
 from flask_socketio import SocketIO, emit
@@ -9,6 +10,9 @@ from flask_socketio import SocketIO, emit
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-change-me')
 app.config['JSON_AS_ASCII'] = False
+LIVEKIT_URL = os.environ.get('LIVEKIT_URL', '')
+LIVEKIT_API_KEY = os.environ.get('LIVEKIT_API_KEY', '')
+LIVEKIT_API_SECRET = os.environ.get('LIVEKIT_API_SECRET', '')
 
 socketio = SocketIO(
     app,
@@ -57,9 +61,32 @@ def health():
         'registered': len(users),
         'online': len(sessions),
         'users': online_users(),
+        'livekit_configured': bool(LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET),
     }
 
+@app.route('/token')
+def get_token():
+    """Выдаёт JWT для подключения к LiveKit-комнате."""
+    username = request.args.get('username', 'guest')
+    room = request.args.get('room', 'test_room')
 
+    if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+        return {'error': 'LiveKit не настроен на сервере'}, 500
+
+    try:
+        token = (
+            lk_api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+            .with_identity(username)
+            .with_name(username)
+            .with_grants(lk_api.VideoGrants(
+                room_join=True,
+                room=room,
+            ))
+            .to_jwt()
+        )
+        return {'token': token, 'url': LIVEKIT_URL}
+    except Exception as e:
+        return {'error': str(e)}, 500
 # ==================== SOCKETIO ====================
 @socketio.on('connect')
 def on_connect():
